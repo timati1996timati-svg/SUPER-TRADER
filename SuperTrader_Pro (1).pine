@@ -1,0 +1,559 @@
+// This Pine Script® code is subject to the terms of the Apache License 2.0
+// SuperTrader Pro - Agentlar firmasi indikatori
+// Python loyihasi bilan bir xil qoidalar: supertrader/agents/firm.py va supertrader/strategies/*.py
+//
+// Nima ko'rsatadi:
+//   * Agentlar firmasi reytingi (SOTIB OL / KO'PAYTIR / KUT / KAMAYTIR / SOT), ball -100..+100
+//   * 7 tahlilchi: trend, momentum, volatillik, hajm, bozor rejimi, ICT/SMC, strategiyalar kengashi
+//   * Risk jamoasi (agressiv / neytral / ehtiyotkor) va tavsiya etilgan pozitsiya hajmi
+//   * Strategiya signallari: Bollinger+RSI+MACD, Donchian trend, EMA kesishuvi, ORB (kun ichida)
+//   * ICT/SMC Confluence (9 omil): BOS, Fair Value Gap, Order Block, talab/taklif zonalari,
+//     S/R, Wyckoff-lite, trend, RSI/MACD, hajm - alohida BUY/SELL signali va zonalar
+//   * Firma BUY/CHIQISH signallari, stop/maqsad chiziqlari, trailing stop
+//   * Ogohlantirishlar (alert) - webhook uchun JSON ham bor
+// Signallar faqat yopilgan shamda tasdiqlanadi (alertlarni "Once Per Bar Close" bilan qo'ying).
+// Confluence balli - omillar soni, g'alaba ehtimoli EMAS. Wyckoff-lite faqat taxminiy proksi;
+// Elliott to'lqinlari ataylab hisoblanmaydi (avtomatik sanash ishonchsiz).
+// Bu moliyaviy maslahat emas.
+
+//@version=6
+indicator("SuperTrader Pro [Agentlar firmasi]", shorttitle="SuperTrader Pro", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=100)
+
+// ============================================================ SOZLAMALAR
+grpView  = "Ko'rinish"
+showMA   = input.bool(true,  "SMA 50 / 200", group=grpView)
+showBB   = input.bool(false, "Bollinger chiziqlari", group=grpView)
+showDon  = input.bool(false, "Donchian kanali", group=grpView)
+showStr  = input.bool(true,  "Strategiya belgilarini ko'rsatish", group=grpView)
+showFirm = input.bool(true,  "Firma BUY / CHIQISH signallari", group=grpView)
+showLvls = input.bool(true,  "Stop / maqsad chiziqlari", group=grpView)
+showBg   = input.bool(false, "Fon rangi = reyting", group=grpView)
+showBar  = input.bool(false, "Sham rangi = reyting", group=grpView)
+showSmc    = input.bool(true,  "ICT/SMC Confluence BUY / SELL", group=grpView)
+showZones  = input.bool(true,  "Talab / taklif zonalari", group=grpView)
+showSwings = input.bool(false, "Swing darajalari va BOS belgilari", group=grpView)
+showTbl  = input.bool(true,  "Panel (dashboard)", group=grpView)
+tblPos   = input.string("Yuqori o'ng", "Panel joyi", options=["Yuqori o'ng", "Yuqori chap", "Pastki o'ng", "Pastki chap"], group=grpView)
+
+// ==================== BEGIN CORE ====================
+grpRisk    = "Risk"
+account    = input.float(10000.0, "Hisob hajmi ($)", minval=1, group=grpRisk)
+riskPct    = input.float(1.0, "Bitta savdoda risk (%)", minval=0.01, maxval=100, step=0.1, group=grpRisk)
+stopAtr    = input.float(2.0, "Stop = ATR x", minval=0.1, step=0.1, group=grpRisk)
+targetAtr  = input.float(3.0, "Maqsad = ATR x", minval=0.1, step=0.1, group=grpRisk)
+trailAtr   = input.float(3.0, "Trailing stop = ATR x", minval=0.1, step=0.1, group=grpRisk)
+allowShort = input.bool(false, "Short (fyuchers) savdoga ruxsat", group=grpRisk)
+
+grpFirm  = "Firma"
+minLevel = input.int(1, "Kirish darajasi (0 = faqat SOTIB OL, 1 = KO'PAYTIR ham)", minval=0, maxval=1, group=grpFirm)
+
+grpBB   = "Bollinger + RSI + MACD"
+bbLen   = input.int(20, "BB davri", minval=2, group=grpBB)
+bbMult  = input.float(2.0, "BB kengligi (std)", minval=0.1, step=0.1, group=grpBB)
+rsiLen  = input.int(14, "RSI davri", minval=2, group=grpBB)
+minConf = input.int(50, "Minimal ishonch balli", minval=0, maxval=100, group=grpBB)
+
+grpDon  = "Donchian trend"
+donLen  = input.int(20, "Yorib o'tish davri", minval=2, group=grpDon)
+donShrt = input.int(20, "Qisqa trend", minval=2, group=grpDon)
+donLong = input.int(60, "Uzun trend", minval=2, group=grpDon)
+
+grpCouncil = "Strategiyalar kengashi"
+minVotes   = input.int(2, "Minimal ovozlar", minval=1, maxval=3, group=grpCouncil)
+voteWindow = input.int(5, "Ovoz oynasi (sham)", minval=1, group=grpCouncil)
+
+grpSmc    = "ICT/SMC Confluence"
+cfEmaFast = input.int(20, "Tez EMA", minval=1, group=grpSmc)
+cfEmaSlow = input.int(50, "Sekin EMA", minval=1, group=grpSmc)
+swingLen  = input.int(5, "Swing pivot (chap/o'ng sham)", minval=1, group=grpSmc)
+fvgAtr    = input.float(0.15, "Min FVG hajmi (ATR x)", minval=0, step=0.05, group=grpSmc)
+obDispAtr = input.float(1.2, "Displacement shami (ATR x)", minval=0, step=0.1, group=grpSmc)
+sdLen     = input.int(10, "Zona pivoti (chap/o'ng sham)", minval=1, group=grpSmc)
+zoneAtr   = input.float(0.25, "Zona qalinligi (ATR x)", minval=0, step=0.05, group=grpSmc)
+srTolPct  = input.float(0.15, "S/R yaqinligi (%)", minval=0, step=0.05, group=grpSmc)
+cfRsiOB   = input.int(70, "RSI yuqori chegara", minval=1, maxval=100, group=grpSmc)
+cfRsiOS   = input.int(30, "RSI pastki chegara", minval=0, maxval=99, group=grpSmc)
+cfVolLen  = input.int(20, "Hajm o'rtachasi", minval=1, group=grpSmc)
+cfVolMult = input.float(1.3, "Hajm sakrashi (x)", minval=0, step=0.1, group=grpSmc)
+wyLen     = input.int(20, "Wyckoff-lite oynasi", minval=2, group=grpSmc)
+cfBuyThr  = input.int(5, "BUY uchun min ball (9 dan)", minval=1, maxval=9, group=grpSmc)
+cfSellThr = input.int(5, "SELL uchun min ball (9 dan)", minval=1, maxval=9, group=grpSmc)
+cfTargetR = input.float(2.0, "Confluence maqsadi (R)", minval=0.1, step=0.1, group=grpSmc)
+
+// ============================================================ INDIKATORLAR
+sma20  = ta.sma(close, 20)
+sma50  = ta.sma(close, 50)
+sma200 = ta.sma(close, 200)
+ema12  = ta.ema(close, 12)
+ema26  = ta.ema(close, 26)
+[macdLine, macdSig, hist] = ta.macd(close, 12, 26, 9)
+rsi    = ta.rsi(close, rsiLen)
+[bbM, bbU, bbL] = ta.bb(close, bbLen, bbMult)
+atr    = ta.atr(14)
+atrPct = atr / close * 100
+atrRank = nz(ta.percentrank(atrPct, 100), 50)
+vwma20 = ta.vwma(close, 20)
+obvEma = ta.ema(ta.obv, 20)
+volAvg = ta.sma(volume, 20)
+volR   = volAvg > 0 ? volume / volAvg : na
+roc20  = ta.roc(close, 20)
+[diP, diM, adx] = ta.dmi(14, 14)
+hasVol = ta.sma(nz(volume) > 0 ? 1.0 : 0.0, 50) > 0.5
+
+// ============================================================ STRATEGIYA AGENTLARI
+// --- Bollinger + RSI + Hajm + MACD (binance-trader) ---
+bbWidth  = bbM != 0 ? (bbU - bbL) / bbM * 100 : na
+widthOk  = not na(bbWidth) and bbWidth >= 1.0 and bbWidth <= 15.0
+pctB     = bbU != bbL ? (close - bbL) / (bbU - bbL) : 0.5
+vr       = nz(volR, 1.0)
+macdUpX  = ta.crossover(hist, 0)
+macdDnX  = ta.crossunder(hist, 0)
+
+bbLongConf() =>
+    c = 30
+    c += rsi < 30 ? 25 : rsi < 40 ? 15 : 0
+    c += vr > 1.2 ? 20 : vr > 1.0 ? 10 : 0
+    c += pctB < 0.1 ? 15 : 0
+    c += macdUpX ? 25 : hist > 0 ? 15 : hist < 0 ? -10 : 0
+    c
+
+bbShortConf() =>
+    c = 30
+    c += rsi > 70 ? 25 : rsi > 60 ? 15 : 0
+    c += vr > 1.2 ? 20 : 0
+    c += pctB > 0.9 ? 15 : 0
+    c += macdDnX ? 25 : hist <= 0 ? 15 : -10
+    c
+
+bbLongC  = bbLongConf()
+bbShortC = bbShortConf()
+bbLong   = widthOk and atr > 0 and not na(rsi) and close <= bbL * 1.005 and bbLongC >= minConf
+bbShort  = widthOk and atr > 0 and not na(rsi) and not bbLong and close >= bbU * 0.995 and bbShortC >= minConf
+
+// --- Donchian kanal trendi (ctp-futures-trader / brother2) ---
+donAtr   = ta.atr(20)
+trShort  = ta.rma(close, donShrt)
+trLong   = ta.rma(close, donLong)
+chHigh   = ta.highest(close, donLen)[1]
+chLow    = ta.lowest(close, donLen)[1]
+donLongS  = not na(trLong) and not na(chHigh) and donAtr > 0 and trShort > trLong and close >= chHigh
+donShortS = not na(trLong) and not na(chLow) and donAtr > 0 and trShort < trLong and close <= chLow
+
+// --- EMA kesishuvi + RSI ---
+emaLong  = ta.crossover(ema12, ema26) and rsi >= 50 and rsi <= 70
+emaShort = ta.crossunder(ema12, ema26) and rsi >= 30 and rsi <= 50
+
+// --- ICT/SMC Confluence (confluence_signal.pine, v6 ga o'tkazilgan) ---
+cfEmaF      = ta.ema(close, cfEmaFast)
+cfEmaS      = ta.ema(close, cfEmaSlow)
+cfTrendBull = close > cfEmaF and cfEmaF > cfEmaS
+cfTrendBear = close < cfEmaF and cfEmaF < cfEmaS
+
+// Bozor tuzilmasi: swing pivotlar -> BOS
+swPH = ta.pivothigh(high, swingLen, swingLen)
+swPL = ta.pivotlow(low, swingLen, swingLen)
+var float swingHigh = na
+var float swingLow  = na
+if not na(swPH)
+    swingHigh := swPH
+if not na(swPL)
+    swingLow := swPL
+bullBOS = ta.crossover(close, swingHigh) and not na(swingHigh)
+bearBOS = ta.crossunder(close, swingLow) and not na(swingLow)
+var int smcBias = 0
+if bullBOS
+    smcBias := 1
+if bearBOS
+    smcBias := -1
+
+// Fair Value Gap (3 shamlik ICT ta'rifi), minimal hajm filtri bilan
+bullFvgRaw = low > high[2] and (low - high[2]) > atr * fvgAtr
+bearFvgRaw = high < low[2] and (low[2] - high) > atr * fvgAtr
+var bool bullFvg = false
+var bool bearFvg = false
+if bullFvgRaw
+    bullFvg := true
+if bearFvgRaw
+    bearFvg := true
+if smcBias == -1
+    bullFvg := false
+if smcBias == 1
+    bearFvg := false
+
+// Order Block: BOS ni keltirib chiqargan kuchli shamdan oldingi teskari rangli sham
+var float obHigh = na
+var float obLow  = na
+var int   obBias = 0
+displacement = math.abs(close - open) > atr * obDispAtr
+if bullBOS and displacement and close[1] < open[1]
+    obHigh := high[1]
+    obLow := low[1]
+    obBias := 1
+if bearBOS and displacement and close[1] > open[1]
+    obHigh := high[1]
+    obLow := low[1]
+    obBias := -1
+inBullOB = obBias == 1 and close <= obHigh and close >= obLow
+inBearOB = obBias == -1 and close >= obLow and close <= obHigh
+
+// Talab / taklif zonalari (kengroq pivot)
+sdPH = ta.pivothigh(high, sdLen, sdLen)
+sdPL = ta.pivotlow(low, sdLen, sdLen)
+var float demandTop = na
+var float demandBot = na
+var float supplyTop = na
+var float supplyBot = na
+if not na(sdPL)
+    demandTop := sdPL + atr * zoneAtr
+    demandBot := sdPL - atr * zoneAtr
+if not na(sdPH)
+    supplyTop := sdPH + atr * zoneAtr
+    supplyBot := sdPH - atr * zoneAtr
+inDemand = not na(demandBot) and close >= demandBot and close <= demandTop
+inSupply = not na(supplyTop) and close <= supplyTop and close >= supplyBot
+
+// S/R: oxirgi swing darajalariga yaqinlik
+nearSup = not na(swingLow) and math.abs(close - swingLow) / close < srTolPct / 100
+nearRes = not na(swingHigh) and math.abs(close - swingHigh) / close < srTolPct / 100
+
+// Momentum, hajm, Wyckoff-lite (diapazon torayishi + hajm - haqiqiy faza aniqlash EMAS)
+cfRsiBull  = rsi > 50 and rsi < cfRsiOB
+cfRsiBear  = rsi < 50 and rsi > cfRsiOS
+cfMacdBull = hist > 0 and hist > hist[1]
+cfMacdBear = hist < 0 and hist < hist[1]
+cfVolMA    = ta.sma(volume, cfVolLen)
+cfVolConf  = volume > cfVolMA * cfVolMult
+wyWidth    = ta.stdev(close, wyLen) * 2 / ta.sma(close, wyLen)
+wyAvg      = ta.sma(wyWidth, wyLen)
+wyMid      = ta.sma(close, wyLen)
+wyContract = wyWidth < wyAvg * 0.85
+accumBias  = wyContract and close < wyMid and cfVolConf
+distBias   = wyContract and close > wyMid and cfVolConf
+
+// 9 omilli ball
+cfBull = (cfTrendBull ? 1 : 0) + (smcBias == 1 ? 1 : 0) + (bullFvg ? 1 : 0) + (inBullOB ? 1 : 0) + (inDemand ? 1 : 0) + (nearSup ? 1 : 0) + (cfRsiBull ? 1 : 0) + (cfMacdBull ? 1 : 0) + (cfVolConf or accumBias ? 1 : 0)
+cfBear = (cfTrendBear ? 1 : 0) + (smcBias == -1 ? 1 : 0) + (bearFvg ? 1 : 0) + (inBearOB ? 1 : 0) + (inSupply ? 1 : 0) + (nearRes ? 1 : 0) + (cfRsiBear ? 1 : 0) + (cfMacdBear ? 1 : 0) + (cfVolConf or distBias ? 1 : 0)
+
+// Signal: ball + tuzilma mosligi; har bir tuzilma bosqichida faqat bitta signal
+cfRawBuy  = cfBull >= cfBuyThr and smcBias == 1 and cfBull > cfBear
+cfRawSell = cfBear >= cfSellThr and smcBias == -1 and cfBear > cfBull
+var bool cfBuyFired  = false
+var bool cfSellFired = false
+if bullBOS
+    cfBuyFired := false
+if bearBOS
+    cfSellFired := false
+cfBuy  = cfRawBuy and not cfBuyFired
+cfSell = cfRawSell and not cfSellFired
+if cfBuy
+    cfBuyFired := true
+if cfSell
+    cfSellFired := true
+
+// Confluence rejasi: stop oxirgi swing ortida (yoki ATR), maqsad = R x risk
+cfStopL = not na(swingLow) and swingLow < close - 0.25 * atr ? swingLow - 0.25 * atr : close - stopAtr * atr
+cfStopS = not na(swingHigh) and swingHigh > close + 0.25 * atr ? swingHigh + 0.25 * atr : close + stopAtr * atr
+cfTgtL  = close + (close - cfStopL) * cfTargetR
+cfTgtS  = close - (cfStopS - close) * cfTargetR
+
+// ============================================================ TAHLILCHILAR (ball)
+// 1) Trend
+trendScore = (na(sma200) ? 0.0 : close > sma200 ? 20.0 : -20.0) + (na(sma50) or na(sma200) ? 0.0 : sma50 > sma200 ? 15.0 : -15.0) + (na(sma50) ? 0.0 : close > sma50 ? 10.0 : -10.0) + (na(ema26) ? 0.0 : ema12 > ema26 ? 10.0 : -10.0)
+
+// 2) Momentum
+xUpRecent = macdUpX or macdUpX[1] or macdUpX[2]
+xDnRecent = macdDnX or macdDnX[1] or macdDnX[2]
+rsiPts    = na(rsi) ? 0.0 : rsi > 70 ? -10.0 : rsi < 30 ? 10.0 : rsi >= 50 ? 10.0 : -10.0
+momScore  = (na(hist) ? 0.0 : (hist > 0 ? 10.0 : -10.0) + (xUpRecent ? 10.0 : xDnRecent ? -10.0 : 0.0)) + rsiPts + (na(roc20) ? 0.0 : roc20 > 0 ? 5.0 : -5.0)
+
+// 3) Volatillik
+volaScore = na(bbU) ? 0.0 : pctB < 0 ? 5.0 : pctB > 1 ? -5.0 : 0.0
+
+// 4) Hajm
+volUpBar   = close > close[1]
+volumScore = not hasVol ? 0.0 : (na(vwma20) ? 0.0 : close > vwma20 ? 5.0 : -5.0) + (na(obvEma) ? 0.0 : ta.obv > obvEma ? 5.0 : -5.0) + (not na(volR) and volR > 1.5 ? (volUpBar ? 5.0 : -5.0) : 0.0)
+
+// 5) Bozor rejimi
+regimeScore = na(adx) ? 0.0 : adx >= 20 ? (diP > diM ? 10.0 : -10.0) : 0.0
+
+// 6) ICT/SMC: faqat tuzilmaga xos omillar (trend/RSI/MACD/hajm yuqorida - ikki marta sanalmaydi)
+smcScore = (smcBias == 1 ? 10.0 : smcBias == -1 ? -10.0 : 0.0) + (bullFvg ? 5.0 : 0.0) - (bearFvg ? 5.0 : 0.0) + (inBullOB ? 5.0 : 0.0) - (inBearOB ? 5.0 : 0.0) + (inDemand ? 5.0 : 0.0) - (inSupply ? 5.0 : 0.0) + (nearSup ? 5.0 : 0.0) - (nearRes ? 5.0 : 0.0) + (accumBias ? 5.0 : 0.0) - (distBias ? 5.0 : 0.0)
+
+// 7) Strategiyalar kengashi: oxirgi 3 shamdagi eng so'nggi signal har bir strategiya uchun
+recentSide(bool longSig, bool shortSig) =>
+    bl = ta.barssince(longSig)
+    bs = ta.barssince(shortSig)
+    l = not na(bl) and bl <= 2
+    s = not na(bs) and bs <= 2
+    l and s ? (bl < bs ? 1 : -1) : l ? 1 : s ? -1 : 0
+
+bbSide   = recentSide(bbLong, bbShort)
+donSide  = recentSide(donLongS, donShortS)
+emaSide  = recentSide(emaLong, emaShort)
+stratScore = 15.0 * (bbSide + donSide + emaSide)
+
+rawScore = trendScore + momScore + volaScore + volumScore + regimeScore + smcScore + stratScore
+score    = math.max(-100.0, math.min(100.0, rawScore))
+lvl      = score >= 40 ? 0 : score >= 15 ? 1 : score > -15 ? 2 : score > -40 ? 3 : 4
+prevLvl  = nz(lvl[1], 2)
+
+ratingText(int l) =>
+    switch l
+        0 => "SOTIB OL"
+        1 => "KO'PAYTIR"
+        2 => "KUT"
+        3 => "KAMAYTIR"
+        => "SOT"
+
+ratingColor(int l) =>
+    switch l
+        0 => #16a34a
+        1 => #65a30d
+        2 => #64748b
+        3 => #ea580c
+        => #dc2626
+
+regimeText = na(adx) ? "noma'lum" : adx >= 25 ? "kuchli trend" : adx >= 20 ? "trend" : "flet"
+
+// ============================================================ TREYDER + RISK JAMOASI + PORTFEL MENEJERI
+planBuy  = lvl <= 1 and atr > 0
+planSell = lvl >= 3 and atr > 0 and allowShort
+strong   = lvl == 0 or lvl == 4
+counter  = (planBuy and not na(sma200) and close < sma200) or (planSell and not na(sma200) and close > sma200)
+aggM     = strong and nz(adx) >= 25 ? 1.5 : 1.0
+neuM     = atrRank >= 80 ? 0.5 : 1.0
+conM     = atrRank >= 95 ? 0.0 : counter ? 0.0 : strong ? 0.75 : 0.5
+medM     = math.max(math.min(aggM, neuM), math.min(math.max(aggM, neuM), conM))
+finalM   = conM == 0 and neuM < 1 ? 0.0 : conM == 0 ? math.min(medM, 0.5) : medM
+finalM  := planBuy or planSell ? finalM : 0.0
+
+planStop   = planBuy ? close - stopAtr * atr : planSell ? close + stopAtr * atr : na
+planTarget = planBuy ? close + targetAtr * atr : planSell ? close - targetAtr * atr : na
+riskAmt    = account * riskPct / 100 * finalM
+qty        = not na(planStop) and close != planStop ? riskAmt / math.abs(close - planStop) : na
+
+// ============================================================ KENGASH (ensemble)
+votesL = (nz(ta.barssince(bbLong), 999) < voteWindow ? 1 : 0) + (nz(ta.barssince(donLongS), 999) < voteWindow ? 1 : 0) + (nz(ta.barssince(emaLong), 999) < voteWindow ? 1 : 0)
+votesS = (nz(ta.barssince(bbShort), 999) < voteWindow ? 1 : 0) + (nz(ta.barssince(donShortS), 999) < voteWindow ? 1 : 0) + (nz(ta.barssince(emaShort), 999) < voteWindow ? 1 : 0)
+councilLong  = votesL >= minVotes and (bbLong or donLongS or emaLong)
+councilShort = allowShort and votesS >= minVotes and (bbShort or donShortS or emaShort)
+
+// ==================== END CORE ====================
+
+// ============================================================ FIRMA SIGNALLARI (pozitsiya holati bilan)
+firmBuyRaw  = planBuy and lvl <= minLevel and prevLvl > minLevel and finalM > 0
+firmSellRaw = planSell and lvl >= 4 - minLevel and prevLvl < 4 - minLevel and finalM > 0
+
+var int   posSide  = 0
+var float trail    = na
+var float entryPx  = na
+var float hiSince  = na
+var float loSince  = na
+firmBuy  = false
+firmShort = false
+firmExit = false
+exitWhy  = ""
+
+if posSide == 1
+    hiSince := math.max(hiSince, high)
+    if low <= trail
+        firmExit := true
+        exitWhy := "trailing stop"
+    else if lvl >= 3
+        firmExit := true
+        exitWhy := "reyting tushdi: " + ratingText(lvl)
+    else
+        trail := math.max(trail, hiSince - trailAtr * atr)
+else if posSide == -1
+    loSince := math.min(loSince, low)
+    if high >= trail
+        firmExit := true
+        exitWhy := "trailing stop"
+    else if lvl <= 1
+        firmExit := true
+        exitWhy := "reyting ko'tarildi: " + ratingText(lvl)
+    else
+        trail := math.min(trail, loSince + trailAtr * atr)
+
+if firmExit
+    posSide := 0
+    trail := na
+else if posSide == 0 and firmBuyRaw and barstate.isconfirmed
+    firmBuy := true
+    posSide := 1
+    entryPx := close
+    hiSince := high
+    trail := planStop
+else if posSide == 0 and firmSellRaw and barstate.isconfirmed
+    firmShort := true
+    posSide := -1
+    entryPx := close
+    loSince := low
+    trail := planStop
+
+// ============================================================ ORB (ochilish diapazoni)
+grpOrb    = "ORB (faqat kun ichidagi taymfreymlar)"
+orbOn     = input.bool(true, "ORB yoqilgan", group=grpOrb)
+orbSess   = input.session("0930-1600", "Seans", group=grpOrb)
+orbTz     = input.string("America/New_York", "Vaqt zonasi", group=grpOrb)
+orbMin    = input.int(15, "Diapazon (daqiqa)", minval=1, group=grpOrb)
+orbCutoff = input.int(360, "Kirish oxirgi muddati (seans boshidan, daqiqa)", minval=1, group=grpOrb)
+orbR      = input.float(1.0, "Maqsad (R)", minval=0.1, step=0.1, group=grpOrb)
+
+inSess  = not na(time(timeframe.period, orbSess, orbTz))
+newSess = inSess and not inSess[1]
+var float orH = na
+var float orL = na
+var int   sessStart = na
+var bool  orTraded = false
+if newSess
+    orH := high
+    orL := low
+    sessStart := time
+    orTraded := false
+else if inSess and not na(sessStart) and time - sessStart < orbMin * 60000
+    orH := math.max(orH, high)
+    orL := math.min(orL, low)
+orDone   = inSess and not na(sessStart) and time - sessStart >= orbMin * 60000 and (time_close - sessStart) / 60000 <= orbCutoff
+orbLong  = orbOn and timeframe.isintraday and orDone and not orTraded and close > orH
+orbShort = orbOn and timeframe.isintraday and allowShort and orDone and not orTraded and not orbLong and close < orL
+if orbLong or orbShort
+    orTraded := true
+orMid = (orH + orL) / 2
+
+// ============================================================ CHIZISH
+plot(showMA ? sma50 : na, "SMA 50", color=color.new(#3b82f6, 0), linewidth=1)
+plot(showMA ? sma200 : na, "SMA 200", color=color.new(#f59e0b, 0), linewidth=2)
+pU = plot(showBB ? bbU : na, "BB yuqori", color=color.new(#94a3b8, 30))
+pL = plot(showBB ? bbL : na, "BB pastki", color=color.new(#94a3b8, 30))
+fill(pU, pL, color=showBB ? color.new(#94a3b8, 92) : na, title="BB fon")
+plot(showDon ? chHigh : na, "Donchian yuqori", color=color.new(#22c55e, 40), style=plot.style_stepline)
+plot(showDon ? chLow : na, "Donchian pastki", color=color.new(#ef4444, 40), style=plot.style_stepline)
+plot(showFirm and posSide != 0 ? trail : na, "Trailing stop", color=color.new(#f43f5e, 0), style=plot.style_linebr, linewidth=2)
+plot(orbOn and timeframe.isintraday and inSess ? orH : na, "ORB yuqori", color=color.new(#a855f7, 30), style=plot.style_linebr)
+plot(orbOn and timeframe.isintraday and inSess ? orL : na, "ORB pastki", color=color.new(#a855f7, 30), style=plot.style_linebr)
+
+plotshape(showStr and bbLong, "Bollinger LONG", shape.circle, location.belowbar, color.new(#22c55e, 0), size=size.tiny)
+plotshape(showStr and bbShort, "Bollinger SHORT", shape.circle, location.abovebar, color.new(#ef4444, 0), size=size.tiny)
+plotshape(showStr and donLongS, "Donchian LONG", shape.triangleup, location.belowbar, color.new(#16a34a, 0), size=size.tiny)
+plotshape(showStr and donShortS, "Donchian SHORT", shape.triangledown, location.abovebar, color.new(#dc2626, 0), size=size.tiny)
+plotshape(showStr and emaLong, "EMA LONG", shape.diamond, location.belowbar, color.new(#0ea5e9, 0), size=size.tiny)
+plotshape(showStr and emaShort, "EMA SHORT", shape.diamond, location.abovebar, color.new(#f97316, 0), size=size.tiny)
+plotshape(showStr and orbLong, "ORB LONG", shape.square, location.belowbar, color.new(#a855f7, 0), size=size.tiny)
+plotshape(showStr and orbShort, "ORB SHORT", shape.square, location.abovebar, color.new(#a855f7, 0), size=size.tiny)
+plotchar(showStr and councilLong, "Kengash LONG", "K", location.belowbar, color.new(#22c55e, 0), size=size.small)
+plotchar(showStr and councilShort, "Kengash SHORT", "K", location.abovebar, color.new(#ef4444, 0), size=size.small)
+
+// ICT/SMC: swing darajalari, BOS, talab/taklif zonalari
+plot(showSwings ? swingHigh : na, "Swing yuqori", color=color.new(#f87171, 30), style=plot.style_stepline)
+plot(showSwings ? swingLow : na, "Swing past", color=color.new(#4ade80, 30), style=plot.style_stepline)
+plotshape(showSwings and bullBOS, "BOS yuqoriga", shape.labelup, location.belowbar, color.new(#16a34a, 30), size=size.tiny, text="BOS", textcolor=color.white)
+plotshape(showSwings and bearBOS, "BOS pastga", shape.labeldown, location.abovebar, color.new(#dc2626, 30), size=size.tiny, text="BOS", textcolor=color.white)
+
+var box demandBox = na
+var box supplyBox = na
+if showZones and not na(sdPL) and not na(demandTop)
+    box.delete(demandBox)
+    demandBox := box.new(bar_index - sdLen, demandTop, bar_index + 10, demandBot, border_color=color.new(#22c55e, 40), bgcolor=color.new(#22c55e, 88))
+if showZones and not na(sdPH) and not na(supplyTop)
+    box.delete(supplyBox)
+    supplyBox := box.new(bar_index - sdLen, supplyTop, bar_index + 10, supplyBot, border_color=color.new(#ef4444, 40), bgcolor=color.new(#ef4444, 88))
+if not na(demandBox)
+    box.set_right(demandBox, bar_index + 10)
+if not na(supplyBox)
+    box.set_right(supplyBox, bar_index + 10)
+
+bgcolor(showBg ? color.new(ratingColor(lvl), 88) : na, title="Reyting foni")
+barcolor(showBar ? ratingColor(lvl) : na, title="Reyting sham rangi")
+
+fmtNum(float x) =>
+    str.tostring(x, format.mintick)
+
+signStr(float x) =>
+    (x >= 0 ? "+" : "") + str.tostring(math.round(x))
+
+whyText() =>
+    "Ball " + signStr(score) + " | Trend " + signStr(trendScore) + " | Momentum " + signStr(momScore) + " | Volatillik " + signStr(volaScore) + " | Hajm " + signStr(volumScore) + " | Rejim " + signStr(regimeScore) + " | ICT/SMC " + signStr(smcScore) + " | Strategiyalar " + signStr(stratScore)
+
+cfText(bool isBuy) =>
+    "Confluence " + (isBuy ? "buqa " + str.tostring(cfBull) : "ayiq " + str.tostring(cfBear)) + "/9" + "\nTrend " + (isBuy ? (cfTrendBull ? "✓" : "·") : (cfTrendBear ? "✓" : "·")) + "  Tuzilma " + (smcBias == 1 ? "buqa" : smcBias == -1 ? "ayiq" : "neytral") + "  FVG " + ((isBuy ? bullFvg : bearFvg) ? "✓" : "·") + "  OB " + ((isBuy ? inBullOB : inBearOB) ? "✓" : "·") + "\nZona " + ((isBuy ? inDemand : inSupply) ? "✓" : "·") + "  S/R " + ((isBuy ? nearSup : nearRes) ? "✓" : "·") + "  RSI " + ((isBuy ? cfRsiBull : cfRsiBear) ? "✓" : "·") + "  MACD " + ((isBuy ? cfMacdBull : cfMacdBear) ? "✓" : "·") + "  Hajm/Wyckoff " + ((isBuy ? (cfVolConf or accumBias) : (cfVolConf or distBias)) ? "✓" : "·")
+
+var line slLine = na
+var line tpLine = na
+if firmBuy or firmShort
+    if showFirm
+        isB = firmBuy
+        label.new(bar_index, isB ? low : high, (isB ? "BUY\n" : "SHORT\n") + ratingText(lvl), style=isB ? label.style_label_up : label.style_label_down, color=isB ? #16a34a : #dc2626, textcolor=color.white, size=size.small, tooltip=whyText() + "\nKirish " + fmtNum(close) + "  Stop " + fmtNum(planStop) + "  Maqsad " + fmtNum(planTarget) + "\nRisk x" + str.tostring(finalM) + "  Hajm " + str.tostring(qty, "#.####"))
+    if showLvls
+        line.delete(slLine)
+        line.delete(tpLine)
+        slLine := line.new(bar_index, planStop, bar_index + 15, planStop, color=#dc2626, style=line.style_dashed, width=1)
+        tpLine := line.new(bar_index, planTarget, bar_index + 15, planTarget, color=#16a34a, style=line.style_dashed, width=1)
+if (orbLong or orbShort) and showStr
+    orbStop = orMid
+    orbTgt = close + (close - orMid) * orbR
+    label.new(bar_index, orbLong ? low : high, "ORB", style=orbLong ? label.style_label_up : label.style_label_down, color=#a855f7, textcolor=color.white, size=size.tiny, tooltip="Diapazon " + fmtNum(orL) + " - " + fmtNum(orH) + "\nKirish " + fmtNum(close) + "  Stop " + fmtNum(orbStop) + "  Maqsad " + fmtNum(orbTgt))
+if firmExit and showFirm
+    label.new(bar_index, high, "CHIQISH", style=label.style_label_down, color=#64748b, textcolor=color.white, size=size.small, tooltip=exitWhy)
+if cfBuy and showSmc
+    label.new(bar_index, low, "SMC\n" + str.tostring(cfBull) + "/9", style=label.style_label_up, color=#0d9488, textcolor=color.white, size=size.small, tooltip=cfText(true) + "\nKirish " + fmtNum(close) + "  Stop " + fmtNum(cfStopL) + "  Maqsad " + fmtNum(cfTgtL))
+if cfSell and showSmc
+    label.new(bar_index, high, "SMC\n" + str.tostring(cfBear) + "/9", style=label.style_label_down, color=#be123c, textcolor=color.white, size=size.small, tooltip=cfText(false) + "\nKirish " + fmtNum(close) + "  Stop " + fmtNum(cfStopS) + "  Maqsad " + fmtNum(cfTgtS))
+
+// ============================================================ PANEL
+tblPosition = tblPos == "Yuqori chap" ? position.top_left : tblPos == "Pastki o'ng" ? position.bottom_right : tblPos == "Pastki chap" ? position.bottom_left : position.top_right
+var table tbl = table.new(tblPosition, 2, 17,bgcolor=color.new(#0f172a, 10), border_color=color.new(#334155, 0), border_width=1, frame_color=color.new(#334155, 0), frame_width=1)
+
+cellRow(int r, string k, string v, color vc) =>
+    table.cell(tbl, 0, r, k, text_color=color.new(#cbd5e1, 0), text_size=size.small, text_halign=text.align_left)
+    table.cell(tbl, 1, r, v, text_color=vc, text_size=size.small, text_halign=text.align_right)
+
+scoreColor(float x) =>
+    x > 0 ? #4ade80 : x < 0 ? #f87171 : #cbd5e1
+
+if showTbl and barstate.islast
+    table.cell(tbl, 0, 0, "SuperTrader Pro", text_color=color.white, text_size=size.normal, bgcolor=color.new(#1e293b, 0))
+    table.cell(tbl, 1, 0, syminfo.ticker, text_color=color.white, text_size=size.normal, bgcolor=color.new(#1e293b, 0))
+    table.cell(tbl, 0, 1, "REYTING", text_color=color.white, text_size=size.normal, bgcolor=ratingColor(lvl))
+    table.cell(tbl, 1, 1, ratingText(lvl), text_color=color.white, text_size=size.normal, bgcolor=ratingColor(lvl))
+    cellRow(2, "Ball", signStr(score) + " / 100", scoreColor(score))
+    cellRow(3, "Bozor rejimi", regimeText + " (ADX " + str.tostring(math.round(nz(adx))) + ")", color.white)
+    cellRow(4, "Trend", signStr(trendScore), scoreColor(trendScore))
+    cellRow(5, "Momentum", signStr(momScore) + "  RSI " + str.tostring(math.round(nz(rsi))), scoreColor(momScore))
+    cellRow(6, "Volatillik", signStr(volaScore) + "  ATR " + str.tostring(math.round(atrRank)) + "%il", scoreColor(volaScore))
+    cellRow(7, "Hajm", hasVol ? signStr(volumScore) : "ma'lumot yo'q", scoreColor(volumScore))
+    cellRow(8, "Rejim (DI)", signStr(regimeScore), scoreColor(regimeScore))
+    cellRow(9, "ICT/SMC", signStr(smcScore) + "  tuzilma " + (smcBias == 1 ? "buqa" : smcBias == -1 ? "ayiq" : "neytral"), scoreColor(smcScore))
+    cellRow(10, "Strategiyalar", signStr(stratScore) + "  (BB " + str.tostring(bbSide) + " / DC " + str.tostring(donSide) + " / EMA " + str.tostring(emaSide) + ")", scoreColor(stratScore))
+    cellRow(11, "Confluence", "buqa " + str.tostring(cfBull) + "/9  ayiq " + str.tostring(cfBear) + "/9", cfBull > cfBear ? #4ade80 : cfBear > cfBull ? #f87171 : #cbd5e1)
+    cellRow(12, "Risk jamoasi", "A x" + str.tostring(aggM) + "  N x" + str.tostring(neuM) + "  E x" + str.tostring(conM), color.white)
+    cellRow(13, "Portfel menejeri", finalM > 0 ? "risk x" + str.tostring(finalM) : "savdo yo'q", finalM > 0 ? #4ade80 : #cbd5e1)
+    cellRow(14, "Reja", planBuy or planSell ? (planBuy ? "BUY " : "SHORT ") + fmtNum(close) + "  SL " + fmtNum(planStop) + "  TP " + fmtNum(planTarget) : "-", color.white)
+    cellRow(15, "Hajm (dona)", na(qty) or finalM == 0 ? "-" : str.tostring(qty, "#.####") + "  ($" + str.tostring(math.round(riskAmt)) + " risk)", color.white)
+    cellRow(16, "Pozitsiya", posSide == 1 ? "LONG  stop " + fmtNum(trail) : posSide == -1 ? "SHORT  stop " + fmtNum(trail) : "yo'q", posSide != 0 ? #facc15 : #cbd5e1)
+
+// ============================================================ OGOHLANTIRISHLAR
+alertcondition(firmBuy, "Firma: BUY", "SuperTrader: {{ticker}} firma BUY, narx {{close}}")
+alertcondition(firmShort, "Firma: SHORT", "SuperTrader: {{ticker}} firma SHORT, narx {{close}}")
+alertcondition(firmExit, "Firma: CHIQISH", "SuperTrader: {{ticker}} pozitsiyadan chiqish, narx {{close}}")
+alertcondition(lvl != prevLvl, "Reyting o'zgardi", "SuperTrader: {{ticker}} reytingi o'zgardi, narx {{close}}")
+alertcondition(councilLong, "Kengash: LONG", "SuperTrader: {{ticker}} kengash LONG, narx {{close}}")
+alertcondition(councilShort, "Kengash: SHORT", "SuperTrader: {{ticker}} kengash SHORT, narx {{close}}")
+alertcondition(bbLong, "Bollinger LONG", "SuperTrader: {{ticker}} Bollinger LONG, narx {{close}}")
+alertcondition(donLongS, "Donchian LONG", "SuperTrader: {{ticker}} Donchian LONG, narx {{close}}")
+alertcondition(emaLong, "EMA LONG", "SuperTrader: {{ticker}} EMA LONG, narx {{close}}")
+alertcondition(orbLong, "ORB LONG", "SuperTrader: {{ticker}} ORB LONG, narx {{close}}")
+// Asl confluence_signal.pine da alertcondition xabariga str.tostring() qo'shilgan edi - bu
+// TradingView'da kompilyatsiya xatosi (xabar o'zgarmas matn bo'lishi shart). Ball endi pastdagi alert() JSON'da.
+alertcondition(cfBuy, "Confluence BUY", "SuperTrader: {{ticker}} ICT/SMC confluence BUY, narx {{close}}")
+alertcondition(cfSell, "Confluence SELL", "SuperTrader: {{ticker}} ICT/SMC confluence SELL, narx {{close}}")
+alertcondition(bullBOS, "BOS yuqoriga", "SuperTrader: {{ticker}} tuzilma yuqoriga yorildi (BOS), narx {{close}}")
+alertcondition(bearBOS, "BOS pastga", "SuperTrader: {{ticker}} tuzilma pastga yorildi (BOS), narx {{close}}")
+
+// "Any alert() function call" bilan ishlatiladi: webhook uchun JSON
+if firmBuy or firmShort
+    alert("{\"source\":\"supertrader\",\"symbol\":\"" + syminfo.ticker + "\",\"action\":\"" + (firmBuy ? "BUY" : "SELL") + "\",\"rating\":\"" + ratingText(lvl) + "\",\"score\":" + str.tostring(math.round(score)) + ",\"price\":" + str.tostring(close) + ",\"stop\":" + str.tostring(planStop) + ",\"target\":" + str.tostring(planTarget) + ",\"risk_multiplier\":" + str.tostring(finalM) + "}", alert.freq_once_per_bar_close)
+if firmExit
+    alert("{\"source\":\"supertrader\",\"symbol\":\"" + syminfo.ticker + "\",\"action\":\"EXIT\",\"reason\":\"" + exitWhy + "\",\"price\":" + str.tostring(close) + "}", alert.freq_once_per_bar_close)
+if cfBuy or cfSell
+    alert("{\"source\":\"supertrader-smc\",\"symbol\":\"" + syminfo.ticker + "\",\"action\":\"" + (cfBuy ? "BUY" : "SELL") + "\",\"bull_score\":" + str.tostring(cfBull) + ",\"bear_score\":" + str.tostring(cfBear) + ",\"price\":" + str.tostring(close) + ",\"stop\":" + str.tostring(cfBuy ? cfStopL : cfStopS) + ",\"target\":" + str.tostring(cfBuy ? cfTgtL : cfTgtS) + "}", alert.freq_once_per_bar_close)
